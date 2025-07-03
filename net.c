@@ -113,12 +113,14 @@ net_device_close(struct net_device *dev)
         errorf("not opened, dev=%s", dev->name);
         return -1;
     }
+
     if (dev->ops->close) {
         if (dev->ops->close(dev) == -1) {
             errorf("failure, dev=%s", dev->name);
             return -1;
         }
     }
+
     dev->flags &= ~NET_DEVICE_FLAG_UP;
     infof("dev=%s, state=%s", dev->name, NET_DEVICE_STATE(dev));
     return 0;
@@ -168,7 +170,7 @@ net_input_handler(uint16_t type, const uint8_t *data, size_t len, struct net_dev
             memcpy(entry->data, data, len);
             
             /* (3) キューに新しいエントリを挿入（失敗したらエラーを返す） */
-            if (queue_push(&proto->queue, entry) == -1) {
+            if (!queue_push(&proto->queue, entry)) {
                 memory_free(entry);
                 errorf("queue_push() failure");
                 return -1;
@@ -177,11 +179,34 @@ net_input_handler(uint16_t type, const uint8_t *data, size_t len, struct net_dev
             debugf("queue pushed (num:%u), dev=%s, type=0x%04x, len=%zu",
                 proto->queue.num, dev->name, type, len);
             debugdump(data, len);
+            intr_raise_irq(INTR_IRQ_SOFTIRQ);
             return 0;
         }
     }
     /* unsupported protocol */
     return 0;
+}
+
+int
+net_softirq_handler(void)
+{
+    struct net_protocol *proto;
+    struct net_protocol_queue_entry *entry;
+
+    for (proto = protocols; proto; proto = proto->next) {
+        while (1) {
+            entry = queue_pop(&proto->queue);
+            if (!entry) {
+                break;
+            }
+            debugf("queue popped (num:%u), dev=%s, type=0x%04x, len=%zu", proto->queue.num, entry->dev->name, proto->type, entry->len);
+            debugdump(entry->data, entry->len);
+            proto->handler(entry->data, entry->len, entry->dev);
+            memory_free(entry);
+        }
+    }
+    return 0;
+
 }
 
 
