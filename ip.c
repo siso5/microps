@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdlib.h>
 
+#include "platform.h"
+
 #include "util.h"
 #include "net.h"
 #include "ip.h"
@@ -11,6 +13,8 @@
 const ip_addr_t IP_ADDR_ANY       = 0x00000000; /* 0.0.0.0 */
 const ip_addr_t IP_ADDR_BROADCAST = 0xffffffff; /* 255.255.255.255 */
 
+/* NOTE: if you want to add/delete the entries after net_run(), you need to protect these lists with a mutex. */
+static struct ip_iface *ifaces;
 
 struct ip_hdr {
     uint8_t vhl;
@@ -51,7 +55,6 @@ ip_addr_pton(const char *p, ip_addr_t *n)
     return 0;
 }
 
-
 char *
 ip_addr_ntop(ip_addr_t n, char *p, size_t size)
 {
@@ -66,7 +69,7 @@ ip_addr_ntop(ip_addr_t n, char *p, size_t size)
 static void
 ip_dump(const uint8_t *data, size_t len)
 {
-        struct ip_hdr *hdr;
+    struct ip_hdr *hdr;
     uint8_t v, hl, hlen;
     uint16_t total, offset;
     char addr[IP_ADDR_STR_LEN];
@@ -95,12 +98,122 @@ ip_dump(const uint8_t *data, size_t len)
 
 }
 
+struct ip_iface *
+ip_iface_alloc(const char *unicast, const char *netmask)
+{
+    struct ip_iface *iface;
+
+    iface = memory_alloc(sizeof(*iface));
+    if (!iface) {
+        errorf("memory_alloc() failure");
+        return NULL;
+    }
+    NET_IFACE(iface)->family = NET_IFACE_FAMILY_IP;
+
+    /* Exercise 7-3 */
+   /*  Exercise 7-3: IPインタフェースにアドレス情報を設定
+   (1) iface->unicast : 引数 unicast を文字列からバイナリ値へ変換して設定する
+    　・変換に失敗した場合はエラーを返す（不要になった iface のメモリ解放をわすれずに）
+   (2) iface->netmask : 引数 netmask を文字列からバイナリ値へ変換して設定する
+    　・変換に失敗した場合はエラーを返す（不要になった iface のメモリ解放をわすれずに）
+   (3) iface->broadcast : iface->unicast と iface->netmask の値から算出して設定する*/
+
+
+   //  (1) iface->unicast : 引数 unicast を文字列からバイナリ値へ変換して設定する
+    if (ip_addr_pton(unicast, &iface->unicast) == -1) {
+        errorf("invalid unicast address: %s", unicast);
+        memory_free(iface);
+        return NULL;
+    }
+
+    //  (2) iface->netmask : 引数 netmask を文字列からバイナリ値へ変換して設定する
+    if (ip_addr_pton(netmask, &iface->netmask) == -1) {
+        errorf("invalid netmask address: %s", netmask);
+        memory_free(iface);
+        return NULL;
+    }
+
+    //  (3) iface->broadcast : iface->unicast と iface->netmask の値から算出して設定する
+    iface->broadcast = iface->unicast | ~iface->netmask;
+
+    /* ------------- */
+
+    return iface;
+
+}
+
+/* NOTE: must not be call after net_run() */
+int
+ip_iface_register(struct net_device *dev, struct ip_iface *iface)
+{
+    char addr1[IP_ADDR_STR_LEN];
+    char addr2[IP_ADDR_STR_LEN];
+    char addr3[IP_ADDR_STR_LEN];
+
+    /* Exercise 7-4 */
+/*  Exercise 7-4: IPインタフェースの登録
+    (1) デバイスにIPインタフェース（iface）を登録する
+　      ・エラーが返されたらこの関数もエラーを返す
+    (2) IPインタフェースのリスト（ifaces）の先頭に iface を挿入する
+*/
+
+    // (1) デバイスにIPインタフェース（iface）を登録する
+    if (net_device_add_iface(dev, NET_IFACE(iface)) == -1) {
+        errorf("net_device_add_iface() failure");
+        return -1;
+    }
+
+    // (2) IPインタフェースのリスト（ifaces）の先頭に iface を挿入する
+    iface->next = ifaces;
+    ifaces = iface;
+
+
+    /* ------------- */
+
+    infof("registered: dev=%s, unicast=%s, netmask=%s, broadcast=%s", dev->name,
+        ip_addr_ntop(iface->unicast, addr1, sizeof(addr1)),
+        ip_addr_ntop(iface->netmask, addr2, sizeof(addr2)),
+        ip_addr_ntop(iface->broadcast, addr3, sizeof(addr3)));
+    return 0;
+
+
+}
+
+struct ip_iface *
+ip_iface_select(ip_addr_t addr)
+{
+
+    /* Exercise 7-5 */
+    /* Exercise 7-5: IPインタフェースの検索
+        ・インタフェースリスト（ifaces）を巡回
+        ・引数 addr で指定されたIPアドレスを持つインタフェースを返す
+        ・合致するインタフェースを発見できなかったら NULL を返す
+    */
+    struct ip_iface *iface;
+    char addr_str[IP_ADDR_STR_LEN];
+    
+    for (iface = ifaces; iface; iface = iface->next) {
+        if (iface->unicast == addr) {
+            debugf("found: dev=%s, unicast=%s", NET_IFACE(iface)->dev->name,
+                ip_addr_ntop(iface->unicast, addr_str, sizeof(addr_str)));
+            return iface;
+        }
+    }
+    debugf("not found: addr=%s", ip_addr_ntop(addr, addr_str, sizeof(addr_str)));
+    return NULL;
+    /* ------------- */
+
+}
+
 static void
 ip_input(const uint8_t *data, size_t len, struct net_device *dev)
 {
     struct ip_hdr *hdr;
     uint8_t v;
     uint16_t hlen, total, offset;
+    struct ip_iface *iface;
+    char addr[IP_ADDR_STR_LEN];
+
 
     if (len < IP_HDR_SIZE_MIN) {
         errorf("too short");
@@ -144,12 +257,37 @@ ip_input(const uint8_t *data, size_t len, struct net_device *dev)
         errorf("fragments does not support");
         return;
     }
-    debugf("dev=%s, protocol=%u, total=%u", dev->name, hdr->protocol, total);
+
+/* Exercise 7-6: IPデータグラムのフィルタリング
+    (1) デバイスに紐づくIPインタフェースを取得
+    　・IPインタフェースを取得できなかったら中断する
+    (2) 宛先IPアドレスの検証
+    　・以下のいずれにも一致しない場合は「他ホスト宛」と判断して中断する（エラーメッセージは出力しない）
+    　　a. インタフェースのユニキャストIPアドレス
+    　　b. ブロードキャストIPアドレス（255.255.255.255）
+    　　c. インタフェースが属するサブネットのブロードキャストIPアドレス（xxx.xxx.xxx.255 など）
+*/
+
+// (1) デバイスに紐づくIPインタフェースを取得
+    iface = (struct ip_iface *)net_device_get_iface(dev, NET_IFACE_FAMILY_IP);
+    if (!iface) {
+        errorf("no ip iface");
+        return;
+    }
+
+    // (2) 宛先IPアドレスの検証
+    if (hdr->dst == iface->unicast || hdr->dst == IP_ADDR_BROADCAST || hdr->dst == iface->broadcast) {
+        debugf("matched: dev=%s, iface=%s, dst=%s", dev->name, ip_addr_ntop(iface->unicast, addr, sizeof(addr)), ip_addr_ntop(hdr->dst, addr, sizeof(addr)));
+    } else {
+        debugf("not matched: dev=%s, iface=%s, dst=%s", dev->name, ip_addr_ntop(iface->unicast, addr, sizeof(addr)), ip_addr_ntop(hdr->dst, addr, sizeof(addr)));
+        return;
+    }
+
+    /* -------------*/
+
+
+    debugf("dev=%s, iface=%s, protocol=%u, total=%u", dev->name, ip_addr_ntop(iface->unicast, addr, sizeof(addr)), hdr->protocol, total);
     ip_dump(data, total);
-
-
-    
-
 
 }
 
