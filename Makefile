@@ -1,14 +1,15 @@
 APPS = 
 
 DRIVERS =  driver/dummy.o \
-		   driver/loopback.o \
+		       driver/loopback.o \
 
 OBJS = util.o \
-	   net.o \
-	   ip.o \
-
+	     net.o \
+	     ip.o \
+       icmp.o \
+  
 TESTS = test/step0.exe \
-		test/step1.exe \
+		    test/step1.exe \
         test/step2.exe \
         test/step3.exe \
         test/step4.exe \
@@ -16,6 +17,7 @@ TESTS = test/step0.exe \
         test/step6.exe \
         test/step7.exe \
         test/step8.exe \
+        test/step9.exe \
 
 
 
