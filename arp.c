@@ -1,12 +1,14 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "util.h"
 #include "net.h"
 #include "ether.h"
 #include "arp.h"
 #include "ip.h"
+#include "platform.h"
 
 /* see https://www.iana.org/assignments/arp-parameters/arp-parameters.txt */
 #define ARP_HRD_ETHER 0x0001
@@ -16,6 +18,13 @@
 #define ARP_OP_REQUEST 1
 #define ARP_OP_REPLY   2
 
+#define ARP_CACHE_SIZE 32
+
+#define ARP_CACHE_STATE_FREE       0
+#define ARP_CACHE_STATE_INCOMPLETE 1
+#define ARP_CACHE_STATE_RESOLVED   2
+#define ARP_CACHE_STATE_STATIC     3
+
 struct arp_hdr {
     uint16_t hrd;
     uint16_t pro;
@@ -23,6 +32,16 @@ struct arp_hdr {
     uint8_t pln;
     uint16_t op;
 };
+
+struct arp_cache {
+    unsigned char state;
+    ip_addr_t pa;
+    uint8_t ha[ETHER_ADDR_LEN];
+    struct timeval timestamp;
+};
+
+static mutex_t mutex = MUTEX_INITIALIZER;
+static struct arp_cache caches[ARP_CACHE_SIZE];
 
 struct arp_ether_ip {
     struct arp_hdr hdr;
@@ -43,6 +62,150 @@ arp_opcode_ntoa(uint16_t opcode)
     }
     return "Unknown";
 }
+
+
+
+/*
+ * ARP Cache
+ *
+ * NOTE: ARP Cache functions must be called after mutex locked
+ */
+
+static void
+arp_cache_delete(struct arp_cache *cache)
+{
+    char addr1[IP_ADDR_STR_LEN];
+    char addr2[ETHER_ADDR_STR_LEN];
+
+    debugf("DELETE: pa=%s, ha=%s", ip_addr_ntop(cache->pa, addr1, sizeof(addr1)), ether_addr_ntop(cache->ha, addr2, sizeof(addr2)));
+
+    /* Exercise 14-1*/
+    /* 
+    Exercise 14-1: キャッシュのエントリを削除する
+    ・state は未使用（FREE）の状態にする
+    ・各フィールドを 0 にする
+    ・timestamp は timerclear() でクリアする
+    */
+    
+    cache->state = ARP_CACHE_STATE_FREE;
+    cache->pa = 0;
+    memset(cache->ha, 0, ETHER_ADDR_LEN);
+    timerclear(&cache->timestamp);
+
+    /* -------------- */
+}
+
+static struct arp_cache *
+arp_cache_alloc(void)
+{
+    struct arp_cache *entry, *oldest = NULL;
+
+    for (entry = caches; entry < tailof(caches); entry++) {
+        if (entry->state == ARP_CACHE_STATE_FREE) {
+            return entry;
+        }
+        if (!oldest || timercmp(&oldest->timestamp, &entry->timestamp, >)) {
+            oldest = entry;
+        }
+    }
+    arp_cache_delete(oldest);
+    return oldest;
+}
+
+
+static struct arp_cache *
+arp_cache_select(ip_addr_t pa)
+{
+    /* Exercise 14-2*/
+    /* 
+    Exercise 14-2: キャッシュの中からプロトコルアドレスが一致するエントリを探して返す
+    ・念のため FREE 状態ではないエントリの中から探す
+    ・見つからなかったら NULL を返す
+    */
+    
+    struct arp_cache *entry;
+    
+    for (entry = caches; entry < tailof(caches); entry++) {
+        if (entry->state != ARP_CACHE_STATE_FREE && entry->pa == pa) {
+            return entry;
+        }
+    }
+    return NULL;
+
+    /* -------------- */
+}
+
+static struct arp_cache *
+arp_cache_update(ip_addr_t pa, const uint8_t *ha)
+{
+    struct arp_cache *cache;
+    char addr1[IP_ADDR_STR_LEN];
+    char addr2[ETHER_ADDR_STR_LEN];
+
+    /* Exercise 14-3*/
+    /* 
+    Exercise 14-3: キャッシュに登録されている情報を更新する
+    (1) arp_cache_select() でエントリを検索する
+    　・見つからなかったらエラー（NULL）を返す
+    (2) エントリの情報を更新する
+    　・state は 解決済み（RESOLVED）の状態にする
+    　・timestamp は gettimeofday() で設定する ※ 使い方がわからなかったら調べること
+    */
+    
+    cache = arp_cache_select(pa);
+    if (!cache) {
+        return NULL;
+    }
+    
+    cache->state = ARP_CACHE_STATE_RESOLVED;
+    memcpy(cache->ha, ha, ETHER_ADDR_LEN);
+    gettimeofday(&cache->timestamp, NULL);
+    
+    debugf("UPDATE: pa=%s, ha=%s", ip_addr_ntop(pa, addr1, sizeof(addr1)), ether_addr_ntop(ha, addr2, sizeof(addr2)));
+    return cache;
+
+    /* -------------- */
+
+}
+
+static struct arp_cache *
+arp_cache_insert(ip_addr_t pa, const uint8_t *ha)
+{
+    struct arp_cache *cache;
+    char addr1[IP_ADDR_STR_LEN];
+    char addr2[ETHER_ADDR_STR_LEN];
+
+    /* Exercise 14-4*/
+    /* 
+    Exercise 14-4: キャッシュに新しくエントリを登録する
+    (1) arp_cache_alloc() でエントリの登録スペースを確保する
+    　・確保できなかったらエラー（NULL）を返す
+    (2) エントリの情報を設定する
+    　・state は 解決済み（RESOLVED）の状態にする
+    　・timestamp は gettimeofday() で設定する ※ 使い方がわからなかったら調べること
+    */
+    
+    cache = arp_cache_alloc();
+    if (!cache) {
+        return NULL;
+    }
+    
+    cache->state = ARP_CACHE_STATE_RESOLVED;
+    cache->pa = pa;
+    memcpy(cache->ha, ha, ETHER_ADDR_LEN);
+    gettimeofday(&cache->timestamp, NULL);
+
+    /* -------------- */
+
+
+    debugf("INSERT: pa=%s, ha=%s", ip_addr_ntop(pa, addr1, sizeof(addr1)), ether_addr_ntop(ha, addr2, sizeof(addr2)));
+    return cache;
+
+
+}
+
+
+
 
 static void
 arp_dump(const uint8_t *data, size_t len)
@@ -116,9 +279,43 @@ arp_reply(struct net_iface *iface, const uint8_t *tha, ip_addr_t tpa, const uint
     return net_device_output(iface->dev, ETHER_TYPE_ARP, (uint8_t *)&reply, sizeof(reply), dst);
 }
 
+
+
+int
+arp_resolve(struct net_iface *iface, ip_addr_t pa, uint8_t *ha)
+{
+      struct arp_cache *cache;
+    char addr1[IP_ADDR_STR_LEN];
+    char addr2[ETHER_ADDR_STR_LEN];
+
+    if (iface->dev->type != NET_DEVICE_TYPE_ETHERNET) {
+        debugf("unsupported hardware address type");
+        return ARP_RESOLVE_ERROR;
+    }
+    if (iface->family != NET_IFACE_FAMILY_IP) {
+        debugf("unsupported protocol address type");
+        return ARP_RESOLVE_ERROR;
+    }
+    mutex_lock(&mutex);
+    cache = arp_cache_select(pa);
+    if (!cache) {
+        debugf("cache not found, pa=%s", ip_addr_ntop(pa, addr1, sizeof(addr1)));
+        mutex_unlock(&mutex);
+        return ARP_RESOLVE_ERROR;
+    }
+    memcpy(ha, cache->ha, ETHER_ADDR_LEN);
+    mutex_unlock(&mutex);
+    debugf("resolved, pa=%s, ha=%s",
+        ip_addr_ntop(pa, addr1, sizeof(addr1)), ether_addr_ntop(ha, addr2, sizeof(addr2)));
+    return ARP_RESOLVE_FOUND;
+
+}
+
+
 static void
 arp_input(const uint8_t *data, size_t len, struct net_device *dev)
 {
+    int marge = 0;
 
     struct arp_ether_ip *msg;
     ip_addr_t spa, tpa;
@@ -164,15 +361,28 @@ arp_input(const uint8_t *data, size_t len, struct net_device *dev)
 
 
 
-
-
-
     debugf("dev=%s, len=%zu", dev->name, len);
     arp_dump(data, len);
     memcpy(&spa, msg->spa, sizeof(spa));
     memcpy(&tpa, msg->tpa, sizeof(tpa));
+
+    mutex_lock(&mutex);
+    if (arp_cache_update(spa, msg->sha)) {
+        /* updated */
+        marge = 1;
+    }
+    mutex_unlock(&mutex);
+
+
     iface = net_device_get_iface(dev, NET_IFACE_FAMILY_IP);
     if (iface && ((struct ip_iface *)iface)->unicast == tpa) {
+
+        if (!marge) {
+            mutex_lock(&mutex);
+            arp_cache_insert(spa, msg->sha);
+            mutex_unlock(&mutex);
+        }
+
 
     /* Exercise 13-2 */
     /*
